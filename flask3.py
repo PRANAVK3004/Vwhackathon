@@ -1,14 +1,12 @@
 """
-Browser-Based Driver Monitoring System - RENDER COMPATIBLE
-Uses dlib instead of MediaPipe (works on Render.com)
+Browser-Based Driver Monitoring - NO SCIPY VERSION
+Works on Render.com free tier
 """
 
 from flask import Flask, jsonify, request, render_template_string
 from flask_cors import CORS
 import cv2
 import numpy as np
-from scipy.spatial import distance
-import base64
 import time
 from collections import defaultdict
 import warnings
@@ -37,75 +35,87 @@ sessions = defaultdict(lambda: {
 })
 
 
+def euclidean_distance(point1, point2):
+    """Calculate distance between two points without scipy"""
+    return np.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
+
+
 class SimpleFaceDetector:
-    """Simple face detection using Haar Cascades (built into OpenCV)"""
+    """Simple face detection using OpenCV only"""
     
     def __init__(self):
-        # Load pre-trained Haar Cascade for face and eye detection
+        # Load Haar Cascades
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+        self.mouth_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile.xml')
         
         self.EAR_THRESHOLD = 0.25
         self.EAR_CONSEC_FRAMES = 20
-        self.PERCLOS_THRESHOLD = 0.2
+        self.MAR_THRESHOLD = 0.6
+        self.MAR_CONSEC_FRAMES = 15
     
     def calculate_ear_from_eye_region(self, eye_region):
-        """Estimate EAR from eye region pixel intensity"""
-        gray = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY)
+        """Estimate EAR from eye region"""
+        if eye_region.size == 0:
+            return 0.3
+        
+        gray = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY) if len(eye_region.shape) == 3 else eye_region
         mean_intensity = np.mean(gray)
         
-        # Closed eyes are darker (lower intensity)
-        # Scale to EAR-like values (0.15-0.35)
+        # Normalize to EAR-like values
         ear = (mean_intensity / 255.0) * 0.2 + 0.15
         return ear
     
     def detect_mouth_opening(self, face_region):
-        """Detect mouth opening based on lower face region"""
-        h, w = face_region.shape[:2]
+        """Detect mouth opening"""
+        if face_region.size == 0:
+            return 0.0
         
-        # Focus on lower third of face (mouth area)
+        h, w = face_region.shape[:2]
         lower_face = face_region[int(h*0.6):h, :]
         
-        gray = cv2.cvtColor(lower_face, cv2.COLOR_BGR2GRAY)
+        if lower_face.size == 0:
+            return 0.0
         
-        # Apply threshold to detect dark regions (open mouth)
+        gray = cv2.cvtColor(lower_face, cv2.COLOR_BGR2GRAY) if len(lower_face.shape) == 3 else lower_face
+        
+        # Detect dark regions (open mouth)
         _, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
         
-        # Count dark pixels (mouth opening)
         dark_pixels = np.sum(thresh == 255)
         total_pixels = thresh.size
         
-        # MAR-like metric
-        mar = dark_pixels / total_pixels if total_pixels > 0 else 0
-        return mar * 10  # Scale up for better sensitivity
+        mar = (dark_pixels / total_pixels) * 10 if total_pixels > 0 else 0.0
+        return mar
     
     def process_frame(self, frame, session_data):
-        """Process frame using Haar Cascades"""
+        """Process frame"""
         h, w = frame.shape[:2]
         session_data['metrics']['total_frames'] += 1
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         # Detect faces
-        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
         
         if len(faces) == 0:
             return {
                 'status': 'no_face',
-                'message': 'No face detected'
+                'message': 'No face detected. Please position your face in front of the camera.'
             }
         
-        # Use first detected face
-        (x, y, w_face, h_face) = faces[0]
+        # Use the largest face
+        faces_sorted = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+        (x, y, w_face, h_face) = faces_sorted[0]
+        
         face_roi = frame[y:y+h_face, x:x+w_face]
         face_gray = gray[y:y+h_face, x:x+w_face]
         
-        # Detect eyes within face
-        eyes = self.eye_cascade.detectMultiScale(face_gray, 1.1, 5)
+        # Detect eyes
+        eyes = self.eye_cascade.detectMultiScale(face_gray, scaleFactor=1.1, minNeighbors=10)
         
         # Calculate EAR
         if len(eyes) >= 2:
-            # Get two most prominent eyes
             eyes_sorted = sorted(eyes, key=lambda e: e[2]*e[3], reverse=True)[:2]
             
             ear_values = []
@@ -117,15 +127,16 @@ class SimpleFaceDetector:
             
             avg_ear = np.mean(ear_values) if ear_values else 0.3
         else:
-            # Estimate from face region if eyes not detected
+            # Estimate from upper face
             upper_face = face_roi[:int(h_face*0.5), :]
-            avg_ear = self.calculate_ear_from_eye_region(upper_face) if upper_face.size > 0 else 0.3
+            avg_ear = self.calculate_ear_from_eye_region(upper_face)
         
-        # Detect mouth opening
+        # Detect mouth/yawning
         mar = self.detect_mouth_opening(face_roi)
         
-        session_data['metrics']['ear'] = avg_ear
-        session_data['metrics']['mar'] = mar
+        # Update metrics
+        session_data['metrics']['ear'] = float(avg_ear)
+        session_data['metrics']['mar'] = float(mar)
         
         # Drowsiness detection
         if avg_ear < self.EAR_THRESHOLD:
@@ -139,9 +150,9 @@ class SimpleFaceDetector:
             session_data['metrics']['is_drowsy'] = False
         
         # Yawn detection
-        if mar > 0.6:
+        if mar > self.MAR_THRESHOLD:
             session_data['metrics']['mar_counter'] += 1
-            if session_data['metrics']['mar_counter'] >= 15:
+            if session_data['metrics']['mar_counter'] >= self.MAR_CONSEC_FRAMES:
                 session_data['metrics']['is_yawning'] = True
         else:
             session_data['metrics']['mar_counter'] = 0
@@ -158,7 +169,7 @@ class SimpleFaceDetector:
         # Calculate PERCLOS
         perclos = (session_data['metrics']['closed_eyes_frames'] / 
                   session_data['metrics']['total_frames']) * 100
-        session_data['metrics']['perclos'] = perclos
+        session_data['metrics']['perclos'] = float(perclos)
         
         session_data['last_update'] = time.time()
         
@@ -174,7 +185,7 @@ detector = SimpleFaceDetector()
 
 @app.route('/')
 def home():
-    """Serve the web interface"""
+    """Serve web interface"""
     html = '''
     <!DOCTYPE html>
     <html>
@@ -189,10 +200,7 @@ def home():
                 min-height: 100vh;
                 padding: 20px;
             }
-            .container {
-                max-width: 1200px;
-                margin: 0 auto;
-            }
+            .container { max-width: 1200px; margin: 0 auto; }
             .header {
                 text-align: center;
                 color: white;
@@ -215,9 +223,7 @@ def home():
                 box-shadow: 0 10px 30px rgba(0,0,0,0.3);
             }
             
-            .video-section {
-                text-align: center;
-            }
+            .video-section { text-align: center; }
             
             #video {
                 width: 100%;
@@ -244,28 +250,13 @@ def home():
                 transition: all 0.3s;
             }
             
-            .btn-start {
-                background: #4CAF50;
-                color: white;
-            }
+            .btn-start { background: #4CAF50; color: white; }
             .btn-start:hover { background: #45a049; }
-            
-            .btn-stop {
-                background: #f44336;
-                color: white;
-            }
+            .btn-stop { background: #f44336; color: white; }
             .btn-stop:hover { background: #da190b; }
-            
-            .btn-reset {
-                background: #ff9800;
-                color: white;
-            }
+            .btn-reset { background: #ff9800; color: white; }
             .btn-reset:hover { background: #e68900; }
-            
-            button:disabled {
-                opacity: 0.5;
-                cursor: not-allowed;
-            }
+            button:disabled { opacity: 0.5; cursor: not-allowed; }
             
             .metrics-grid {
                 display: grid;
@@ -301,16 +292,8 @@ def home():
                 font-weight: bold;
             }
             
-            .alert-normal {
-                background: #4CAF50;
-                color: white;
-            }
-            
-            .alert-warning {
-                background: #ff9800;
-                color: white;
-            }
-            
+            .alert-normal { background: #4CAF50; color: white; }
+            .alert-warning { background: #ff9800; color: white; }
             .alert-critical {
                 background: #f44336;
                 color: white;
@@ -330,15 +313,8 @@ def home():
                 margin-top: 10px;
             }
             
-            .status-active {
-                background: #4CAF50;
-                color: white;
-            }
-            
-            .status-inactive {
-                background: #999;
-                color: white;
-            }
+            .status-active { background: #4CAF50; color: white; }
+            .status-inactive { background: #999; color: white; }
             
             .info-box {
                 background: #e3f2fd;
@@ -346,15 +322,12 @@ def home():
                 padding: 15px;
                 margin-top: 20px;
                 border-radius: 5px;
+                font-size: 0.9em;
             }
             
             @media (max-width: 768px) {
-                .main-grid {
-                    grid-template-columns: 1fr;
-                }
-                .metrics-grid {
-                    grid-template-columns: 1fr;
-                }
+                .main-grid { grid-template-columns: 1fr; }
+                .metrics-grid { grid-template-columns: 1fr; }
                 .header h1 { font-size: 1.8em; }
             }
         </style>
@@ -383,8 +356,13 @@ def home():
                     </div>
                     
                     <div class="info-box">
-                        <strong>ℹ️ Note:</strong> This uses Haar Cascade detection (lightweight). 
-                        Works best with good lighting and frontal face view.
+                        <strong>💡 Tips:</strong>
+                        <ul style="text-align: left; margin-top: 10px; padding-left: 20px;">
+                            <li>Position your face in front of camera</li>
+                            <li>Ensure good lighting</li>
+                            <li>Look directly at camera</li>
+                            <li>First load may take 30-60 seconds</li>
+                        </ul>
                     </div>
                 </div>
                 
@@ -393,12 +371,12 @@ def home():
                     
                     <div class="metrics-grid">
                         <div class="metric">
-                            <div class="metric-label">👁️ EAR</div>
+                            <div class="metric-label">👁️ EAR (Eye Aspect Ratio)</div>
                             <div class="metric-value" id="ear">0.000</div>
                         </div>
                         
                         <div class="metric">
-                            <div class="metric-label">😮 MAR</div>
+                            <div class="metric-label">😮 MAR (Mouth Aspect)</div>
                             <div class="metric-value" id="mar">0.000</div>
                         </div>
                         
@@ -413,12 +391,12 @@ def home():
                         </div>
                         
                         <div class="metric">
-                            <div class="metric-label">📹 Frames</div>
+                            <div class="metric-label">📹 Frames Processed</div>
                             <div class="metric-value" id="frames">0</div>
                         </div>
                         
                         <div class="metric">
-                            <div class="metric-label">😴 Drowsy</div>
+                            <div class="metric-label">😴 Drowsiness</div>
                             <div class="metric-value" id="drowsy">NO</div>
                         </div>
                     </div>
@@ -446,7 +424,11 @@ def home():
             startBtn.addEventListener('click', async () => {
                 try {
                     stream = await navigator.mediaDevices.getUserMedia({ 
-                        video: { width: 640, height: 480 } 
+                        video: { 
+                            width: 640, 
+                            height: 480,
+                            facingMode: 'user'
+                        } 
                     });
                     video.srcObject = stream;
                     
@@ -457,9 +439,12 @@ def home():
                     statusBadge.textContent = '🟢 Active';
                     statusBadge.className = 'status-badge status-active';
                     
-                    processFrames();
+                    // Wait for video to be ready
+                    video.onloadedmetadata = () => {
+                        processFrames();
+                    };
                 } catch (err) {
-                    alert('Error accessing webcam: ' + err.message);
+                    alert('Error accessing webcam: ' + err.message + '. Please allow camera access.');
                 }
             });
             
@@ -512,13 +497,15 @@ def home():
                         
                         if (data.status === 'success') {
                             updateMetrics(data.metrics);
+                        } else if (data.status === 'no_face') {
+                            console.log(data.message);
                         }
                     } catch (err) {
                         console.error('Processing error:', err);
                     }
                     
-                    setTimeout(processFrames, 100);
-                }, 'image/jpeg', 0.8);
+                    setTimeout(processFrames, 150);
+                }, 'image/jpeg', 0.7);
             }
             
             function updateMetrics(metrics) {
@@ -527,7 +514,7 @@ def home():
                 document.getElementById('perclos').textContent = metrics.perclos.toFixed(1) + '%';
                 document.getElementById('blinks').textContent = metrics.blink_count;
                 document.getElementById('frames').textContent = metrics.total_frames;
-                document.getElementById('drowsy').textContent = metrics.is_drowsy ? 'YES' : 'NO';
+                document.getElementById('drowsy').textContent = metrics.is_drowsy ? 'YES ⚠️' : 'NO ✓';
                 
                 const alertBox = document.getElementById('alertBox');
                 if (metrics.is_drowsy) {
@@ -553,25 +540,19 @@ def home():
 
 @app.route('/api/process_frame', methods=['POST'])
 def process_frame():
-    """Process frame sent from browser"""
+    """Process frame from browser"""
     try:
         session_id = request.form.get('session_id', 'default')
         image_file = request.files.get('image')
         
         if not image_file:
-            return jsonify({
-                'status': 'error',
-                'message': 'No image provided'
-            }), 400
+            return jsonify({'status': 'error', 'message': 'No image'}), 400
         
         image_bytes = np.frombuffer(image_file.read(), np.uint8)
         frame = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
         
         if frame is None:
-            return jsonify({
-                'status': 'error',
-                'message': 'Invalid image'
-            }), 400
+            return jsonify({'status': 'error', 'message': 'Invalid image'}), 400
         
         session_data = sessions[session_id]
         result = detector.process_frame(frame, session_data)
@@ -579,63 +560,41 @@ def process_frame():
         return jsonify(result), 200
         
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @app.route('/api/metrics', methods=['GET'])
 def get_metrics():
-    """Get metrics for a session"""
+    """Get session metrics"""
     session_id = request.args.get('session_id', 'default')
     
     if session_id not in sessions:
-        return jsonify({
-            'status': 'error',
-            'message': 'Session not found'
-        }), 404
+        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
     
-    return jsonify({
-        'status': 'success',
-        'data': sessions[session_id]['metrics']
-    }), 200
+    return jsonify({'status': 'success', 'data': sessions[session_id]['metrics']}), 200
 
 
 @app.route('/api/reset', methods=['POST'])
 def reset_session():
-    """Reset session counters"""
+    """Reset counters"""
     data = request.json
     session_id = data.get('session_id', 'default')
     
     if session_id in sessions:
         sessions[session_id]['metrics'] = {
-            'ear': 0.0,
-            'mar': 0.0,
-            'perclos': 0.0,
-            'blink_count': 0,
-            'total_frames': 0,
-            'closed_eyes_frames': 0,
-            'is_drowsy': False,
-            'is_yawning': False,
-            'ear_counter': 0,
-            'mar_counter': 0,
-            'blink_counter': 0
+            'ear': 0.0, 'mar': 0.0, 'perclos': 0.0,
+            'blink_count': 0, 'total_frames': 0, 'closed_eyes_frames': 0,
+            'is_drowsy': False, 'is_yawning': False,
+            'ear_counter': 0, 'mar_counter': 0, 'blink_counter': 0
         }
     
-    return jsonify({
-        'status': 'success',
-        'message': 'Session reset successfully'
-    }), 200
+    return jsonify({'status': 'success', 'message': 'Reset successfully'}), 200
 
 
 @app.route('/api/health', methods=['GET'])
 def health():
     """Health check"""
-    return jsonify({
-        'status': 'healthy',
-        'service': 'Driver Monitoring System'
-    }), 200
+    return jsonify({'status': 'healthy', 'service': 'Driver Monitoring'}), 200
 
 
 if __name__ == '__main__':
