@@ -187,7 +187,8 @@ Waiting for data...
                 stopButton.disabled = false;
                 processing = true;
                 animationFrameId = requestAnimationFrame(processLoop);
-                console.log("Camera started");
+                console.log("Camera started, beginning process loop...");
+                resultsDiv.textContent = "Camera started. Waiting for first analysis from server...";
             } catch (err) {
                 console.error("Error accessing webcam:", err);
                 resultsDiv.textContent = "Error: Could not access webcam. " + err.message;
@@ -211,14 +212,6 @@ Waiting for data...
                 return;
             }
 
-            context.clearRect(0, 0, canvas.width, canvas.height);
-            context.save();
-            context.scale(-1, 1);
-            context.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
-            context.restore();
-            
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-
             try {
                 const response = await fetch(API_URL, {
                     method: 'POST',
@@ -226,29 +219,37 @@ Waiting for data...
                     body: JSON.stringify({ image: dataUrl })
                 });
 
+                // Log the raw response
+                console.log("Raw response:", response);
+
                 if (!response.ok) {
                     const errorText = await response.text();
-                    throw new Error(`Server error: ${response.status} ${errorText}`);
+                    console.error("Server error response:", errorText);
+                    throw new Error(`Server returned ${response.status}: ${errorText}`);
                 }
 
                 const result = await response.json();
+                console.log("Parsed JSON result:", result);
                 
                 if (result.status === 'success') {
                     updateUI(result.data);
                     resultsDiv.textContent = JSON.stringify(result.data, null, 2);
                 } else {
-                    resultsDiv.textContent = `Error: ${result.message}`;
+                    // Server reported an error, e.g., "No image data"
+                    console.error("API error:", result.message);
+                    resultsDiv.textContent = `API Error: ${result.message}`;
                 }
 
             } catch (err) {
+                // Network error or fetch failed
                 console.error("Error processing frame:", err);
-                resultsDiv.textContent = `Error: ${err.message}. Is the server running?`;
-                stopCamera();
+                // Update the UI to show the error clearly
+                resultsDiv.textContent = `Network Error: ${err.message}\n\nIs the server running and not crashing? Check server logs. Retrying...`;
+                // We will NOT call stopCamera() here, so it retries.
+                // stopCamera(); 
             }
 
-            if(processing) animationFrameId = requestAnimationFrame(processLoop);
-        }
-
+            // Request next frame
         function updateUI(data) {
             const riskLevel = data.risk_level;
             riskLevelDiv.textContent = riskLevel;
